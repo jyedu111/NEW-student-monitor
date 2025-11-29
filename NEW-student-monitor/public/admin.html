@@ -12,53 +12,183 @@
 </head>
 <body>
   <h2>🌐 黑名单管理</h2>
-  <form onsubmit="addBlacklist(); return false;">
-    <input type="text" id="domain" placeholder="域名（如：qq.com）" required>
+  <form id="addForm" onsubmit="addBlacklist(event); return false;" style="display:flex; gap:8px; align-items:center; margin-bottom:8px;">
+    <input type="text" id="domain" placeholder="域名（如：qq.com）" required autocomplete="off" style="flex:1;">
+    <input type="text" id="reason" placeholder="原因（可选，例如：教学禁止）" style="width:260px;">
     <button type="submit">➕ 添加</button>
   </form>
 
+  <div style="display:flex; gap:8px; align-items:center; margin-bottom:10px;">
+    <div style="flex:1;">
+      <input id="search" placeholder="搜索域名/原因（模糊匹配）" style="width:100%; padding:8px;" />
+    </div>
+    <div>
+      每页：
+      <select id="pageSize">
+        <option>10</option>
+        <option selected>25</option>
+        <option>50</option>
+      </select>
+    </div>
+  </div>
+
+  <p id="preview" style="color:#555; margin-top:6px;">实时预览：<span id="preview-text">（请输入域名）</span></p>
+
   <table id="list">
-    <thead><tr><th>域名</th><th>操作</th></tr></thead>
+    <thead><tr><th>域名</th><th>原因</th><th>创建时间</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
 
   <script>
-    function loadList() {
-      fetch('/api/blacklist')
-        .then(r => r.json())
-        .then(domains => {
-          const tbody = document.querySelector('#list tbody');
-          tbody.innerHTML = '';
-          domains.forEach(domain => {
-            const tr = document.createElement('tr');
-            tr.innerHTML = `
-              <td>${domain}</td>
-              <td><button onclick="remove('${domain}')">🗑️ 删除</button></td>
-            `;
-            tbody.appendChild(tr);
-          });
-        });
+    const listBody = document.querySelector('#list tbody');
+    const domainInput = document.getElementById('domain');
+    const previewText = document.getElementById('preview-text');
+    const reasonInput = document.getElementById('reason');
+    const searchInput = document.getElementById('search');
+    const pageSizeSelect = document.getElementById('pageSize');
+
+    let pendingRows = new Map(); // key -> tr for optimistic rows
+
+    function renderRow(item) {
+      const tr = document.createElement('tr');
+      tr.dataset.id = item.id || '';
+      tr.innerHTML = `
+        <td>${escapeHtml(item.domain)}</td>
+        <td>${escapeHtml(item.reason || '')}</td>
+        <td>${escapeHtml(item.created_at || '')}</td>
+        <td><button data-id="${item.id}" class="del-btn">🗑️ 删除</button></td>
+      `;
+      const btn = tr.querySelector('.del-btn');
+      btn.addEventListener('click', () => removeDomain(item.id, item.domain, tr));
+      return tr;
     }
 
-    function addBlacklist() {
-      const domain = document.getElementById('domain').value.trim();
-      fetch('/api/blacklist/add', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ domain })
-      }).then(() => {
-        alert('✅ 添加成功！');
-        document.getElementById('domain').value = '';
-        loadList();
+    function escapeHtml(s) {
+      if (!s) return '';
+      return String(s).replace(/[&<>\"']/g, function (c) {
+        return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c];
       });
     }
 
-    function remove(domain) {
-      if (!confirm(`确定删除 ${domain}？`)) return;
-      fetch(`/api/blacklist/${encodeURIComponent(domain)}`, { method: 'DELETE' })
-        .then(() => loadList());
+    // fullRows: the complete list fetched from server
+    let fullRows = [];
+    // paging state
+    let currentPage = 1;
+
+    async function loadList() {
+      try {
+        const res = await fetch('/api/blacklist/domains');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        fullRows = await res.json();
+        listBody.innerHTML = '';
+        renderPage();
+        // re-append any pending rows (optimistic)
+        for (const [key, tr] of pendingRows) {
+          listBody.insertBefore(tr, listBody.firstChild);
+        }
+      } catch (err) {
+        console.error('加载黑名单失败', err);
+        listBody.innerHTML = `<tr><td colspan="4" style="color:#d32f2f;">加载失败：${err.message}</td></tr>`;
+      }
     }
 
+    function applyFilter(rows) {
+      const q = (searchInput.value || '').trim().toLowerCase();
+      if (!q) return rows;
+      return rows.filter(r => (r.domain || '').toLowerCase().includes(q) || (r.reason || '').toLowerCase().includes(q));
+    }
+
+    function renderPage() {
+      const pageSize = Number(pageSizeSelect.value || 25);
+      const filtered = applyFilter(fullRows);
+      const total = filtered.length;
+      const totalPages = Math.max(1, Math.ceil(total / pageSize));
+      if (currentPage > totalPages) currentPage = totalPages;
+      const start = (currentPage - 1) * pageSize;
+      const pageRows = filtered.slice(start, start + pageSize);
+      listBody.innerHTML = '';
+      pageRows.forEach(item => listBody.appendChild(renderRow(item)));
+      // add paging footer row
+      const footerTr = document.createElement('tr');
+      footerTr.innerHTML = `<td colspan="4" style="text-align:right;padding:8px;">
+        共 ${total} 条，页 ${currentPage}/${totalPages} &nbsp;
+        <button id="prevBtn" ${currentPage<=1? 'disabled':''}>上一页</button>
+        <button id="nextBtn" ${currentPage>=totalPages? 'disabled':''}>下一页</button>
+      </td>`;
+      listBody.appendChild(footerTr);
+      document.getElementById('prevBtn').addEventListener('click', () => { currentPage = Math.max(1, currentPage-1); renderPage(); });
+      document.getElementById('nextBtn').addEventListener('click', () => { currentPage = Math.min(totalPages, currentPage+1); renderPage(); });
+      // re-append pending optimistic rows on top
+      for (const [key, tr] of pendingRows) {
+        listBody.insertBefore(tr, listBody.firstChild);
+      }
+    }
+
+    // input preview
+    domainInput.addEventListener('input', (e) => {
+      const v = e.target.value.trim();
+      previewText.textContent = v ? v : '（请输入域名）';
+    });
+    // search & paging events
+    searchInput.addEventListener('input', () => { currentPage = 1; renderPage(); });
+    pageSizeSelect.addEventListener('change', () => { currentPage = 1; renderPage(); });
+
+    async function addBlacklist(e) {
+      e.preventDefault();
+      const domain = domainInput.value.trim();
+      if (!domain) return;
+
+      // create optimistic row
+      const tempKey = 'pending:' + Date.now();
+      const tr = document.createElement('tr');
+      tr.className = 'pending';
+      tr.innerHTML = `
+        <td>${escapeHtml(domain)} <small style="color:#1976d2;">（正在添加...）</small></td>
+        <td></td>
+        <td></td>
+        <td><button disabled>...</button></td>
+      `;
+      pendingRows.set(tempKey, tr);
+      listBody.insertBefore(tr, listBody.firstChild);
+      domainInput.value = '';
+      previewText.textContent = '（请输入域名）';
+
+      try {
+          const resp = await fetch('/api/blacklist/domains/add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ domain, reason: reasonInput.value.trim() })
+          });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || JSON.stringify(data));
+
+        // server returned ok or message. Refresh list to get server-assigned id
+        pendingRows.delete(tempKey);
+        await loadList();
+      } catch (err) {
+        // remove optimistic row and show error message
+        pendingRows.delete(tempKey);
+        if (tr.parentNode) tr.parentNode.removeChild(tr);
+        alert('添加失败：' + (err.message || err));
+      }
+    }
+
+    async function removeDomain(id, domain, tr) {
+      if (!confirm(`确定删除 ${domain}？`)) return;
+      try {
+        const resp = await fetch(`/api/blacklist/domains/${id}`, { method: 'DELETE' });
+        if (!resp.ok) {
+          const txt = await resp.text();
+          throw new Error(txt || resp.statusText);
+        }
+        // remove row
+        if (tr && tr.parentNode) tr.parentNode.removeChild(tr);
+      } catch (err) {
+        alert('删除失败：' + (err.message || err));
+      }
+    }
+
+    // initial load
     loadList();
   </script>
 </body>
